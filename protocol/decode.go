@@ -39,7 +39,7 @@ func (d *decoder) Read(b []byte) (int, error) {
 	if d.err != nil {
 		return 0, d.err
 	}
-	if d.remain == 0 {
+	if d.remain <= 0 {
 		return 0, io.EOF
 	}
 	if len(b) > d.remain {
@@ -143,12 +143,20 @@ func (d *decoder) discard(n int) {
 		n, err = r.Discard(n)
 		d.remain -= n
 	} else {
-		_, err = io.Copy(ioutil.Discard, d)
+		// Copy exactly n bytes: copying until EOF would consume data past
+		// the requested boundary and desynchronize the decoder.
+		_, err = io.CopyN(ioutil.Discard, d, int64(n))
 	}
 	d.setError(err)
 }
 
 func (d *decoder) read(n int) []byte {
+	// Validate the length before allocating: a corrupt length prefix must not
+	// be able to trigger a huge allocation or a panic.
+	if n < 0 || n > d.remain {
+		d.setError(io.ErrUnexpectedEOF)
+		return nil
+	}
 	b := make([]byte, n)
 	n, err := io.ReadFull(d, b)
 	b = b[:n]

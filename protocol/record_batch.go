@@ -115,6 +115,11 @@ type optimizedRecordReader struct {
 	index   int
 	buffer  Record
 	headers [][]Header
+	// err is a sticky error reported after all the valid records have been
+	// consumed (e.g. when the batch was truncated). Once set, the reader never
+	// advances past the valid records, so programs cannot observe records from
+	// an unknown position after a decode failure.
+	err error
 }
 
 func (r *optimizedRecordReader) ReadRecord() (*Record, error) {
@@ -131,6 +136,9 @@ func (r *optimizedRecordReader) ReadRecord() (*Record, error) {
 			r.buffer.Headers = r.headers[i]
 		}
 		return &r.buffer, nil
+	}
+	if r.err != nil {
+		return nil, r.err
 	}
 	return nil, io.EOF
 }

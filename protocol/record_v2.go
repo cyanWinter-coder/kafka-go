@@ -7,13 +7,43 @@ import (
 	"time"
 )
 
+const (
+	// Size in bytes of the record batch header which follows the base offset
+	// and batch length fields in the v2 record batch format:
+	//
+	//   partition leader epoch (4) + magic (1) + crc (4) + attributes (2) +
+	//   last offset delta (4) + first timestamp (8) + max timestamp (8) +
+	//   producer id (8) + producer epoch (2) + base sequence (4) +
+	//   record count (4)
+	recordBatchHeaderSizeV2 = 49
+
+	// Minimum size in bytes of a v2 record, including its length prefix:
+	// length (>=1) + attributes (1) + timestamp delta (>=1) +
+	// offset delta (>=1) + key length (>=1) + value length (>=1) +
+	// header count (>=1).
+	recordMinSizeV2 = 7
+
+	// Minimum size in bytes of the body of a v2 record, i.e. everything but
+	// its length prefix.
+	recordBodyMinSizeV2 = recordMinSizeV2 - 1
+)
+
 func (rs *RecordSet) readFromVersion2(d *decoder) error {
 	baseOffset := d.readInt64()
 	batchLength := d.readInt32()
 
-	if int(batchLength) > d.remain || d.err != nil {
+	if d.err != nil || int(batchLength) > d.remain {
+		// The response was truncated before the end of the batch; keep the
+		// historical behavior of discarding the partial batch.
 		d.discardAll()
 		return nil
+	}
+
+	// A batch length smaller than its header, including negative values,
+	// cannot be valid: report it instead of letting it desynchronize the
+	// decoding of the message set.
+	if batchLength < recordBatchHeaderSizeV2 {
+		return fmt.Errorf("invalid record batch length: %d", batchLength)
 	}
 
 	dec := &decoder{
@@ -41,6 +71,10 @@ func (rs *RecordSet) readFromVersion2(d *decoder) error {
 	_ = lastOffsetDelta
 	_ = maxTimestamp
 
+	if dec.err != nil {
+		return dec.err
+	}
+
 	if compression := Attributes(attributes).Compression(); compression != 0 {
 		codec := compression.Codec()
 		if codec == nil {
@@ -65,6 +99,14 @@ func (rs *RecordSet) readFromVersion2(d *decoder) error {
 	recordsLength := buffer.Len()
 	dec.reader = buffer
 	dec.remain = recordsLength
+
+	// Each record takes at least recordMinSizeV2 bytes, so a count which is
+	// negative or larger than what the records section can hold is corrupt.
+	// Checking before allocating guards against panics and against huge
+	// allocations driven by a malicious count.
+	if numRecords < 0 || int64(numRecords) > int64(recordsLength)/recordMinSizeV2 {
+		return fmt.Errorf("invalid record count %d in record batch of %d bytes", numRecords, recordsLength)
+	}
 
 	records := make([]optimizedRecord, numRecords)
 	// These are two lazy allocators that will be used to optimize allocation of
@@ -92,48 +134,102 @@ func (rs *RecordSet) readFromVersion2(d *decoder) error {
 	// slices are lazily allocated in a separate array.
 	headers := ([][]Header)(nil)
 
+	// tailErr carries a decode error found after some records were decoded
+	// successfully; it is reported by the record reader once the valid records
+	// have been consumed so the reader never advances into an unknown position.
+	var tailErr error
+
 	for i := range records {
 		r := &records[i]
-		_ = dec.readVarInt() // record length (unused)
-		_ = dec.readInt8()   // record attributes (unused)
-		timestampDelta := dec.readVarInt()
-		offsetDelta := dec.readVarInt()
+
+		recordLength := dec.readVarInt()
+		if dec.err != nil {
+			// The batch was truncated in the middle of the records section.
+			// Keep the records decoded so far.
+			records = records[:i]
+			tailErr = fmt.Errorf("record batch truncated: %w", dontExpectEOF(dec.err))
+			break
+		}
+
+		if recordLength < recordBodyMinSizeV2 {
+			return fmt.Errorf("invalid record length %d at index %d in record batch", recordLength, i)
+		}
+
+		if recordLength > int64(dec.remain) {
+			// The last record of the batch extends past the end of the
+			// records section: the batch is truncated.
+			records = records[:i]
+			tailErr = fmt.Errorf("record batch truncated: record of %d bytes at index %d exceeds the %d remaining bytes",
+				recordLength, i, dec.remain)
+			break
+		}
+
+		// Decode the record body from a sub-decoder bounded by the record
+		// length prefix, so a malformed record cannot misalign the decoding of
+		// the records which follow it.
+		rec := &decoder{reader: dec, remain: int(recordLength)}
+
+		_ = rec.readInt8() // record attributes (unused)
+		timestampDelta := rec.readVarInt()
+		offsetDelta := rec.readVarInt()
+
+		if rec.err == nil && offsetDelta < 0 {
+			rec.setError(fmt.Errorf("invalid negative offset delta %d at index %d in record batch", offsetDelta, i))
+		}
+
+		keyLength := rec.readVarInt()
+		keyOffset := int64(recordsLength - dec.remain)
+		if rec.err == nil && (keyLength < -1 || keyLength > int64(rec.remain)) {
+			rec.setError(fmt.Errorf("invalid key length %d at index %d in record batch", keyLength, i))
+		}
+		if keyLength > 0 {
+			rec.discard(int(keyLength))
+		}
+
+		valueLength := rec.readVarInt()
+		valueOffset := int64(recordsLength - dec.remain)
+		if rec.err == nil && (valueLength < -1 || valueLength > int64(rec.remain)) {
+			rec.setError(fmt.Errorf("invalid value length %d at index %d in record batch", valueLength, i))
+		}
+		if valueLength > 0 {
+			rec.discard(int(valueLength))
+		}
+
+		numHeaders := rec.readVarInt()
+		if rec.err == nil && (numHeaders < 0 || 2*numHeaders > int64(rec.remain)) {
+			// Each header takes at least two bytes for the key and value
+			// length prefixes.
+			rec.setError(fmt.Errorf("invalid header count %d at index %d in record batch", numHeaders, i))
+		}
+
+		var recordHeaders []Header
+		if numHeaders > 0 && rec.err == nil {
+			recordHeaders = make([]Header, numHeaders)
+
+			for j := range recordHeaders {
+				recordHeaders[j] = Header{
+					Key:   readRecordHeaderKey(rec),
+					Value: readRecordHeaderValue(rec),
+				}
+			}
+		}
+
+		if rec.err != nil {
+			return rec.err
+		}
+
+		// Skip any bytes left in the record to remain aligned on the record
+		// boundaries described by the length prefixes.
+		rec.discardAll()
 
 		r.offset = baseOffset + offsetDelta
 		r.timestamp = firstTimestamp + timestampDelta
 
-		keyLength := dec.readVarInt()
-		keyOffset := int64(recordsLength - dec.remain)
-		if keyLength > 0 {
-			dec.discard(int(keyLength))
-		}
-
-		valueLength := dec.readVarInt()
-		valueOffset := int64(recordsLength - dec.remain)
-		if valueLength > 0 {
-			dec.discard(int(valueLength))
-		}
-
-		if numHeaders := dec.readVarInt(); numHeaders > 0 {
+		if numHeaders > 0 {
 			if headers == nil {
 				headers = make([][]Header, numRecords)
 			}
-
-			h := make([]Header, numHeaders)
-
-			for i := range h {
-				h[i] = Header{
-					Key:   dec.readVarString(),
-					Value: dec.readVarBytes(),
-				}
-			}
-
-			headers[i] = h
-		}
-
-		if dec.err != nil {
-			records = records[:i]
-			break
+			headers[i] = recordHeaders
 		}
 
 		if keyLength >= 0 {
@@ -147,11 +243,15 @@ func (rs *RecordSet) readFromVersion2(d *decoder) error {
 		}
 	}
 
+	if tailErr == nil && dec.remain != 0 {
+		return fmt.Errorf("record batch contains %d trailing bytes after %d records", dec.remain, numRecords)
+	}
+
 	// Note: it's unclear whether kafka 0.11+ still truncates the responses,
 	// all attempts I made at constructing a test to trigger a truncation have
 	// failed. I kept this code here as a safeguard but it may never execute.
-	if dec.err != nil && len(records) == 0 {
-		return dec.err
+	if tailErr != nil && len(records) == 0 {
+		return tailErr
 	}
 
 	*rs = RecordSet{
@@ -160,6 +260,7 @@ func (rs *RecordSet) readFromVersion2(d *decoder) error {
 		Records: &optimizedRecordReader{
 			records: records,
 			headers: headers,
+			err:     tailErr,
 		},
 	}
 
@@ -186,6 +287,42 @@ func (rs *RecordSet) readFromVersion2(d *decoder) error {
 	}
 
 	return nil
+}
+
+// readRecordHeaderKey reads a record header key from d, validating its length
+// against the number of bytes remaining in the record to prevent panics and
+// excessive allocations on corrupt input.
+func readRecordHeaderKey(d *decoder) string {
+	n := d.readVarInt()
+	if d.err != nil {
+		return ""
+	}
+	if n > int64(d.remain) {
+		d.setError(fmt.Errorf("invalid record header key length: %d", n))
+		return ""
+	}
+	if n < 0 {
+		return ""
+	}
+	return bytesToString(d.read(int(n)))
+}
+
+// readRecordHeaderValue reads a record header value from d, validating its
+// length against the number of bytes remaining in the record to prevent panics
+// and excessive allocations on corrupt input.
+func readRecordHeaderValue(d *decoder) []byte {
+	n := d.readVarInt()
+	if d.err != nil {
+		return nil
+	}
+	if n > int64(d.remain) {
+		d.setError(fmt.Errorf("invalid record header value length: %d", n))
+		return nil
+	}
+	if n < 0 {
+		return nil
+	}
+	return d.read(int(n))
 }
 
 func (rs *RecordSet) writeToVersion2(buffer *pageBuffer, bufferOffset int64) error {
